@@ -1,0 +1,22 @@
+# Compiled binaries
+/raftkvd
+/bin/
+*.exe
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+
+# Node data directories produced at runtime
+/data/
+*.raftlog
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local working notes, not part of the published repo
+/docs/
+/steps.md
