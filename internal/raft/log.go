@@ -59,6 +59,16 @@ func (l *Log) Append(commands ...[]byte) Index {
 	return l.LastIndex()
 }
 
+// Restore appends entries that already carry their own index and term.
+//
+// This is the follower's path: followers never assign indexes or terms, they
+// store exactly what the leader sent. Entries must be contiguous with the
+// current end of the log, which the caller guarantees by running the
+// consistency check first.
+func (l *Log) Restore(entries []LogEntry) {
+	l.entries = append(l.entries, entries...)
+}
+
 // TermAt returns the term of the entry at index, and whether that index exists.
 func (l *Log) TermAt(index Index) (Term, bool) {
 	entry, ok := l.EntryAt(index)

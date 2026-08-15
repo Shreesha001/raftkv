@@ -140,6 +140,36 @@ func (c *cluster) describe() string {
 	return out.String()
 }
 
+// propose submits a command to the current leader and settles the cluster.
+func (c *cluster) propose(leader *Node, command string) Index {
+	c.t.Helper()
+
+	index, err := leader.Propose([]byte(command))
+	if err != nil {
+		c.t.Fatalf("Propose(%q): %v", command, err)
+	}
+	c.deliver()
+	// Followers learn the new commit index from the leader's next message, so
+	// run far enough for a heartbeat to carry it.
+	c.run(c.nodes[leader.ID()].cfg.HeartbeatTick + 1)
+	return index
+}
+
+// commands returns a node's log contents as strings, for comparison.
+func (c *cluster) commands(id NodeID) []string {
+	n := c.nodes[id]
+
+	var out []string
+	for i := Index(1); i <= n.log.LastIndex(); i++ {
+		entry, ok := n.log.EntryAt(i)
+		if !ok {
+			break
+		}
+		out = append(out, string(entry.Command))
+	}
+	return out
+}
+
 func TestClusterElectsExactlyOneLeader(t *testing.T) {
 	c := newCluster(t, 1, 2, 3)
 
@@ -275,5 +305,165 @@ func TestFiveNodeClusterLosesQuorum(t *testing.T) {
 	// The three-node side is itself a majority, so it may legitimately elect.
 	if got := len(c.leaders(4, 5)); got > 1 {
 		t.Errorf("majority side has %d leaders, want at most 1", got)
+	}
+}
+
+// End to end: a write reaches every node, in order, and is committed.
+func TestClusterReplicatesProposalsToEveryNode(t *testing.T) {
+	c := newCluster(t, 1, 2, 3)
+	leader := c.awaitLeader(100)
+
+	for _, cmd := range []string{"set x 1", "set y 2", "del x"} {
+		c.propose(leader, cmd)
+	}
+
+	want := []string{"set x 1", "set y 2", "del x"}
+	for id := range c.nodes {
+		got := c.commands(id)
+		if len(got) != len(want) {
+			t.Fatalf("%v: log has %d entries %q, want %d %q", id, len(got), got, len(want), want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%v: entry %d = %q, want %q", id, i+1, got[i], want[i])
+			}
+		}
+	}
+
+	// And every node knows those entries are committed, so every node may
+	// apply them.
+	for id, n := range c.nodes {
+		if got := n.CommitIndex(); got != 3 {
+			t.Errorf("%v: CommitIndex() = %d, want 3", id, got)
+		}
+	}
+}
+
+// Committed entries reach the application exactly once, in log order, and
+// identically on every node — the property the whole system exists to provide.
+func TestClusterDeliversIdenticalCommittedEntries(t *testing.T) {
+	c := newCluster(t, 1, 2, 3)
+	leader := c.awaitLeader(100)
+
+	for _, cmd := range []string{"a", "b", "c", "d"} {
+		c.propose(leader, cmd)
+	}
+
+	applied := map[NodeID][]string{}
+	for id, n := range c.nodes {
+		for _, entry := range n.CommittedEntries() {
+			applied[id] = append(applied[id], string(entry.Command))
+		}
+	}
+
+	want := []string{"a", "b", "c", "d"}
+	for id, got := range applied {
+		if len(got) != len(want) {
+			t.Fatalf("%v: applied %q, want %q", id, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("%v: applied[%d] = %q, want %q", id, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// A follower that misses writes while partitioned is brought back into line by
+// the leader once it returns. No operator action, no special recovery path.
+func TestPartitionedFollowerCatchesUp(t *testing.T) {
+	c := newCluster(t, 1, 2, 3)
+	leader := c.awaitLeader(100)
+
+	var victim NodeID
+	for id := range c.nodes {
+		if id != leader.ID() {
+			victim = id
+			break
+		}
+	}
+	c.isolated[victim] = true
+
+	// The remaining two are still a majority, so writes continue committing.
+	for _, cmd := range []string{"a", "b", "c"} {
+		c.propose(leader, cmd)
+	}
+	if got := len(c.commands(victim)); got != 0 {
+		t.Fatalf("isolated node has %d entries, want 0", got)
+	}
+
+	c.isolated[victim] = false
+	c.run(50)
+
+	got := c.commands(victim)
+	want := []string{"a", "b", "c"}
+	if len(got) != len(want) {
+		t.Fatalf("after healing, log = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i+1, got[i], want[i])
+		}
+	}
+}
+
+// Acknowledged writes survive losing the leader: the election restriction
+// guarantees the replacement already holds every committed entry.
+func TestCommittedEntriesSurviveLeaderFailure(t *testing.T) {
+	c := newCluster(t, 1, 2, 3)
+	original := c.awaitLeader(100)
+
+	for _, cmd := range []string{"a", "b"} {
+		c.propose(original, cmd)
+	}
+
+	c.isolated[original.ID()] = true
+	replacement := c.awaitLeader(100, original.ID())
+
+	got := c.commands(replacement.ID())
+	if len(got) < 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("new leader's log = %q, want it to retain committed entries a, b", got)
+	}
+
+	// And the cluster keeps accepting writes.
+	c.propose(replacement, "c")
+	if got := c.commands(replacement.ID()); got[len(got)-1] != "c" {
+		t.Errorf("log = %q, want it to end with the new write", got)
+	}
+}
+
+// A leader whose log diverged while partitioned has its extra entries
+// discarded on rejoining. Those entries were never committed, so nothing that
+// was ever acknowledged is lost.
+func TestDivergentEntriesAreOverwrittenAfterPartition(t *testing.T) {
+	c := newCluster(t, 1, 2, 3)
+	original := c.awaitLeader(100)
+	c.propose(original, "shared")
+
+	// Isolate the leader and let it accept writes nobody else sees. Alone, it
+	// cannot reach a majority, so these can never commit.
+	c.isolated[original.ID()] = true
+	for _, cmd := range []string{"orphan1", "orphan2"} {
+		if _, err := original.Propose([]byte(cmd)); err != nil {
+			t.Fatalf("Propose: %v", err)
+		}
+	}
+	c.deliver()
+
+	// The majority elects a new leader and makes progress without it.
+	replacement := c.awaitLeader(100, original.ID())
+	c.propose(replacement, "real")
+
+	c.isolated[original.ID()] = false
+	c.run(100)
+
+	got := c.commands(original.ID())
+	for _, cmd := range got {
+		if cmd == "orphan1" || cmd == "orphan2" {
+			t.Fatalf("uncommitted entry %q survived; log = %q", cmd, got)
+		}
+	}
+	if len(got) == 0 || got[len(got)-1] != "real" {
+		t.Errorf("log = %q, want it to end with the committed write %q", got, "real")
 	}
 }

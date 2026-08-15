@@ -86,6 +86,22 @@ type Node struct {
 	// votes records who has answered this node's candidacy, and how.
 	votes map[NodeID]bool
 
+	// commitIndex is the highest entry known to be on a majority, and so safe
+	// to apply. lastApplied is how far the application has actually consumed.
+	commitIndex Index
+	lastApplied Index
+
+	// Leader-only bookkeeping, rebuilt at every election.
+	//
+	// nextIndex is the leader's guess at what to send each follower next. It
+	// starts optimistic and is walked back when a follower rejects, which is
+	// how a leader discovers where a divergent log first differs.
+	//
+	// matchIndex is what the leader knows a follower actually holds. Only
+	// acknowledgements raise it, and it is what commitment is counted from.
+	nextIndex  map[NodeID]Index
+	matchIndex map[NodeID]Index
+
 	electionElapsed  int
 	heartbeatElapsed int
 	// electionTimeout is re-randomised for every election.
@@ -139,6 +155,32 @@ func (n *Node) Term() Term { return n.currentTerm }
 // VotedFor returns who this node voted for in the current term, or None.
 func (n *Node) VotedFor() NodeID { return n.votedFor }
 
+// CommitIndex returns the highest log index known to be committed.
+func (n *Node) CommitIndex() Index { return n.commitIndex }
+
+// CommittedEntries returns entries that have become safe to apply since the
+// last call, in log order, and marks them consumed.
+//
+// This is how committed commands reach the application. Raft hands over
+// opaque bytes and never learns what they meant.
+func (n *Node) CommittedEntries() []LogEntry {
+	if n.lastApplied >= n.commitIndex {
+		return nil
+	}
+
+	out := make([]LogEntry, 0, n.commitIndex-n.lastApplied)
+	for i := n.lastApplied + 1; i <= n.commitIndex; i++ {
+		entry, ok := n.log.EntryAt(i)
+		if !ok {
+			break
+		}
+		out = append(out, entry)
+	}
+	n.lastApplied = n.commitIndex
+
+	return out
+}
+
 // Messages returns everything the node wants sent and clears its outbox. The
 // caller is responsible for delivery, and Raft assumes nothing about whether
 // it succeeds — dropped messages are recovered by retry and timeout.
@@ -169,7 +211,7 @@ func (n *Node) Tick() {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTick {
 			n.heartbeatElapsed = 0
-			n.broadcastHeartbeat()
+			n.broadcastAppend()
 		}
 	}
 }
@@ -261,26 +303,24 @@ func (n *Node) becomeLeader() {
 	n.log.SetTerm(n.currentTerm)
 	n.heartbeatElapsed = 0
 
-	n.logger.V(1).Info("became leader", "term", n.currentTerm)
+	// A new leader knows nothing about its followers' logs, so it assumes they
+	// match its own and corrects downwards as rejections arrive. Guessing high
+	// costs a few extra round trips; guessing low would risk overwriting
+	// entries a follower legitimately holds.
+	n.nextIndex = make(map[NodeID]Index, len(n.peers))
+	n.matchIndex = make(map[NodeID]Index, len(n.peers))
+	for _, peer := range n.peers {
+		n.nextIndex[peer] = n.log.LastIndex() + 1
+		n.matchIndex[peer] = 0
+	}
+
+	n.logger.V(1).Info("became leader", "term", n.currentTerm,
+		"lastIndex", n.log.LastIndex())
 
 	// Announce immediately rather than waiting a heartbeat interval: until
 	// followers hear from the new leader they are still counting down to their
 	// own elections.
-	n.broadcastHeartbeat()
-}
-
-// broadcastHeartbeat sends an empty AppendEntries to every peer, which is how
-// a leader says "still here" and keeps followers from standing for election.
-func (n *Node) broadcastHeartbeat() {
-	for _, peer := range n.peers {
-		n.send(Message{
-			Type:         MsgAppendEntries,
-			To:           peer,
-			Term:         n.currentTerm,
-			PrevLogIndex: n.log.LastIndex(),
-			PrevLogTerm:  n.log.LastTerm(),
-		})
-	}
+	n.broadcastAppend()
 }
 
 // send queues a message for the caller to deliver.

@@ -77,4 +77,9 @@ type Message struct {
 	// Success reports whether the consistency check passed.
 	// (MsgAppendEntriesResponse)
 	Success bool
+
+	// MatchIndex is the highest index the follower now holds, reported back so
+	// the leader learns how far replication reached without having to infer it
+	// from what it happened to send. (MsgAppendEntriesResponse)
+	MatchIndex Index
 }

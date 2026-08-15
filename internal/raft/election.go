@@ -32,7 +32,7 @@ func (n *Node) Step(m Message) {
 	case MsgAppendEntries:
 		n.handleAppendEntries(m)
 	case MsgAppendEntriesResponse:
-		// Handled in the replication phase.
+		n.handleAppendEntriesResponse(m)
 	}
 }
 
@@ -115,30 +115,4 @@ func (n *Node) handleRequestVoteResponse(m Message) {
 		"from", int(m.From), "granted", m.Granted, "needed", n.quorum())
 
 	n.tallyVotes()
-}
-
-// handleAppendEntries processes a message from a leader.
-//
-// In this phase it establishes only the leadership relationship: entries are
-// replicated in the next one. Reaching here means the term check already
-// passed, so the sender is a legitimate leader for this term.
-func (n *Node) handleAppendEntries(m Message) {
-	// A candidate that hears from a leader in its own term has lost, and
-	// concedes rather than splitting the cluster further.
-	if n.state == Candidate {
-		n.logger.V(1).Info("conceding to leader", "leader", int(m.From), "term", m.Term)
-		n.becomeFollower(m.Term, n.votedFor)
-	}
-
-	// Contact from a leader restarts the countdown. This is the entire purpose
-	// of heartbeats: a leader that keeps talking keeps its followers from
-	// standing for election.
-	n.electionElapsed = 0
-
-	n.send(Message{
-		Type:    MsgAppendEntriesResponse,
-		To:      m.From,
-		Term:    n.currentTerm,
-		Success: true,
-	})
 }
