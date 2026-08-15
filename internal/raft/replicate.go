@@ -20,6 +20,7 @@ func (n *Node) Propose(command []byte) (Index, error) {
 
 	index := n.log.Append(command)
 	n.matchIndex[n.id] = index
+	n.persist()
 
 	n.logger.V(2).Info("proposal accepted", "index", index, "term", n.currentTerm)
 
@@ -104,7 +105,12 @@ func (n *Node) handleAppendEntries(m Message) {
 		return
 	}
 
-	n.appendFromLeader(m.Entries)
+	if len(m.Entries) > 0 {
+		n.appendFromLeader(m.Entries)
+		// Durable before acknowledged: the leader may commit on the strength
+		// of this reply, so the entries must survive a crash here.
+		n.persist()
+	}
 
 	// The leader tells us how far it has committed. We may be behind it, so
 	// clamp to what we actually hold: claiming to have committed entries we do

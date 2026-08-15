@@ -27,6 +27,11 @@ type Config struct {
 	// leader and the cluster churns through pointless elections.
 	HeartbeatTick int
 
+	// Storage persists term, vote, and log across restarts. Nil means the node
+	// keeps nothing, which is useful in tests but unsafe in production: a node
+	// that forgets its vote can vote twice in one term and elect two leaders.
+	Storage Storage
+
 	// Logger receives protocol events. Use logr.Discard() to silence a node.
 	Logger logr.Logger
 	// Rand supplies election timeout jitter. Nil means a source seeded from
@@ -139,8 +144,58 @@ func NewNode(cfg Config) *Node {
 	}
 	n.resetElectionTimeout()
 
-	n.logger.V(1).Info("node started", "peers", len(n.peers))
+	if err := n.restore(); err != nil {
+		// A node that cannot read its own state cannot tell whether it has
+		// already voted this term, so it cannot participate safely.
+		panic(err)
+	}
+
+	n.logger.V(1).Info("node started",
+		"peers", len(n.peers), "term", n.currentTerm, "lastIndex", n.log.LastIndex())
 	return n
+}
+
+// restore reloads state written before the last shutdown.
+func (n *Node) restore() error {
+	if n.cfg.Storage == nil {
+		return nil
+	}
+
+	state, found, err := n.cfg.Storage.Load()
+	if err != nil {
+		return fmt.Errorf("raft: load persisted state: %w", err)
+	}
+	if !found {
+		return nil
+	}
+
+	n.currentTerm = state.Term
+	n.votedFor = state.VotedFor
+	n.log = NewLogFrom(state.Entries)
+	n.log.SetTerm(state.Term)
+	return nil
+}
+
+// persist writes durable state, and stops the node if it cannot.
+//
+// Failing loudly is the only safe response. A node that continues after losing
+// its vote may vote twice in one term, which permits two leaders and loses
+// acknowledged writes — a silent, unrecoverable corruption. Crashing is
+// recoverable; that is not.
+func (n *Node) persist() {
+	if n.cfg.Storage == nil {
+		return
+	}
+
+	err := n.cfg.Storage.Save(PersistentState{
+		Term:     n.currentTerm,
+		VotedFor: n.votedFor,
+		Entries:  n.log.Entries(),
+	})
+	if err != nil {
+		n.logger.Error(err, "cannot persist state; refusing to continue")
+		panic(fmt.Errorf("raft: persist state: %w", err))
+	}
 }
 
 // ID returns this node's identifier.
@@ -252,6 +307,7 @@ func (n *Node) becomeFollower(term Term, votedFor NodeID) {
 	n.votedFor = votedFor
 	n.votes = make(map[NodeID]bool)
 	n.resetElectionTimeout()
+	n.persist()
 }
 
 // startElection begins a new term with this node as a candidate.
@@ -261,6 +317,7 @@ func (n *Node) startElection() {
 	n.votedFor = n.id
 	n.votes = map[NodeID]bool{n.id: true} // a candidate always votes for itself
 	n.resetElectionTimeout()
+	n.persist()
 
 	n.logger.V(1).Info("standing for election", "term", n.currentTerm)
 

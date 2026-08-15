@@ -27,6 +27,27 @@ func NewLog() *Log {
 	}
 }
 
+// NewLogFrom rebuilds a log from persisted entries, restoring the sentinel if
+// the stored data does not already begin with one.
+func NewLogFrom(entries []LogEntry) *Log {
+	l := NewLog()
+	for _, e := range entries {
+		if e.Index == 0 {
+			continue // the sentinel is already present
+		}
+		l.entries = append(l.entries, e)
+	}
+	return l
+}
+
+// Entries returns a copy of every entry including the sentinel, for
+// persistence.
+func (l *Log) Entries() []LogEntry {
+	out := make([]LogEntry, len(l.entries))
+	copy(out, l.entries)
+	return out
+}
+
 // SetTerm sets the term stamped onto subsequently appended entries. A leader
 // calls this when it takes office.
 func (l *Log) SetTerm(term Term) {

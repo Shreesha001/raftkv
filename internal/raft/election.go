@@ -85,6 +85,10 @@ func (n *Node) handleRequestVote(m Message) {
 		// Having just endorsed a candidate, give it time to win before
 		// standing against it.
 		n.resetElectionTimeout()
+		// The vote must be durable before it is promised: a node that
+		// forgets it after a crash could vote again in the same term and
+		// help elect a second leader.
+		n.persist()
 	}
 
 	n.logger.V(2).Info("vote requested",
