@@ -2,8 +2,6 @@
 
 **A distributed key-value store in Go, with the Raft consensus algorithm implemented from scratch.**
 
-No `hashicorp/raft`. No `etcd/raft`. No consensus library of any kind — leader election, log replication, and the safety rules are written here, from the [paper](https://raft.github.io/raft.pdf).
-
 Three nodes replicate a log of commands. The cluster survives losing one node without losing a single acknowledged write, and without ever electing two leaders.
 
 ```
@@ -39,7 +37,7 @@ $ curl -L -X PUT localhost:8082/kv/after -d 'still works'
 write after failover: 200                                  ← still serving
 ```
 
-Bring the dead node back and it rejoins, discovers it has been superseded, and catches up on everything it missed — with no operator involvement:
+Bring the dead node back and it rejoins, discovers it has been superseded, and catches up on everything it missed, with no operator involvement:
 
 ```console
 $ ./raftkvd -id 1 ...                                      # restart it
@@ -51,7 +49,7 @@ $ curl -L localhost:8081/kv/after
 still works                                                ← caught up
 ```
 
-Nobody told node 1 that node 2 had died. Nobody told node 1 it had been replaced. Both facts were inferred from silence and from a number that went up.
+Nobody told node 1 that node 2 had died. Nobody told node 1 it had been replaced. Both facts were inferred from silence, and from a number that went up.
 
 ---
 
@@ -74,13 +72,13 @@ Server 2 hears:  x=9, x=5   →  x is 5
 Server 3 hears:  x=5, x=9   →  x is 9
 ```
 
-Three servers, three answers, no way to say which is right. **The hard problem in distributed systems is not storage — it is agreement.**
+Three servers, three answers, no way to say which is right. **The hard problem in distributed systems is not storage. It is agreement.**
 
-### How Raft solves it
+## How Raft solves it
 
-**1 — Elect one leader.** All writes go through a single node, so one brain decides the order. Not for speed; for the existence of an order at all.
+**1. Elect one leader.** All writes go through a single node, so one brain decides the order. Not for speed, but so that an order exists at all.
 
-**2 — Replicate the log, not the data.** Nodes exchange numbered instructions, never values:
+**2. Replicate the log, not the data.** Nodes exchange numbered instructions, never values:
 
 ```
 index:    1          2          3          4
@@ -88,15 +86,44 @@ term:     1          1          3          3
         SET x=5    SET y=2    DEL x     SET x=9
 ```
 
-Same instructions, same order, same starting point → same final state. This is *state machine replication*, and it works because **"do you have entry 7?" is a question with a crisp answer that survives crashes, retries, and duplicate packets.** "Is your data correct?" is not.
+Same instructions, same order, same starting point, therefore the same final state. This is *state machine replication*, and it works because **"do you have entry 7?" is a question with a crisp answer that survives crashes, retries, and duplicate packets.** "Is your data correct?" is not.
 
-**3 — Require a majority.** A leader may only act while it can reach more than half the cluster. Two groups each larger than half must share at least one member, and that member will not back a second leader. So split-brain is impossible **by arithmetic, not by luck** — which is why clusters are 3, 5, or 7 nodes, tolerating 1, 2, or 3 failures.
+**3. Require a majority.** A leader may only act while it can reach more than half the cluster. Two groups each larger than half must share at least one member, and that member will not back a second leader. Split-brain is therefore impossible **by arithmetic, not by luck**, which is why clusters are 3, 5, or 7 nodes, tolerating 1, 2, or 3 failures.
 
-### How failure is detected
+### A write, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant L as Leader
+    participant F1 as Follower A
+    participant F2 as Follower B
+
+    C->>L: PUT /kv/x = 5
+    Note over L: append entry 7 to own log,<br/>write to disk before promising anything
+    par replicate
+        L->>F1: AppendEntries(prev=6, entry 7)
+        L->>F2: AppendEntries(prev=6, entry 7)
+    end
+    Note over F1,F2: does my log match at entry 6?<br/>yes → store entry 7, fsync
+    F1-->>L: ack matchIndex=7
+    Note over L: 2 of 3 hold it. That is a majority,<br/>so entry 7 is committed.
+    L->>L: apply SET x=5 to the map
+    L-->>C: 200 OK
+    F2-->>L: ack matchIndex=7 (late, harmless)
+    L->>F1: next heartbeat carries commitIndex=7
+    L->>F2: next heartbeat carries commitIndex=7
+    Note over F1,F2: now safe to apply entry 7
+```
+
+The client hears `200` only after a majority holds the write on disk. Any single node can then be destroyed without losing it.
+
+## How failure is detected
 
 A dead machine cannot announce that it died. It just goes quiet.
 
-So the leader sends an empty **heartbeat** every few tens of milliseconds meaning *"still here."* A follower that hears nothing for a full election timeout concludes the leader is gone and stands for election. **Silence is the signal.** Everything else — the failover above — follows from that one idea.
+So the leader sends an empty **heartbeat** every few tens of milliseconds meaning *"still here."* A follower that hears nothing for a full election timeout concludes the leader is gone and stands for election. **Silence is the signal.** The failover at the top of this page follows entirely from that one idea.
 
 ---
 
@@ -128,7 +155,7 @@ Kill node 2, and node 1 works it out for itself:
 "became leader"             node=1  term=2
 ```
 
-Verbosity is klog-style, so this detail is off by default and one flag away when you need it:
+Verbosity is klog-style, so this detail stays off by default and is one flag away when you need it:
 
 | `-v` | Shows |
 |:----:|-------|
@@ -144,7 +171,7 @@ Verbosity is klog-style, so this detail is off by default and one flag away when
 ```
 cmd/raftkvd/          flags, wiring, graceful shutdown
 internal/
-  raft/               consensus core — pure logic, zero I/O
+  raft/               consensus core: pure logic, zero I/O
   storage/            durable term, vote, and log
   transport/          Raft messages as JSON over HTTP
   kv/                 the state machine: commands → map
@@ -155,9 +182,9 @@ internal/
 
 ### The core knows nothing
 
-`internal/raft` has no idea what a network, a disk, a clock, or a key-value store is. They arrive as interfaces, and commands are opaque `[]byte` it moves without ever interpreting.
+`internal/raft` has no idea what a network, a disk, a clock, or a key-value store is. They arrive as interfaces, and commands are opaque `[]byte` that it moves between nodes without ever interpreting.
 
-This is not a stylistic preference — it is verified:
+This is not a stylistic preference. It is verified:
 
 ```console
 $ go list -deps ./internal/raft | grep raftkv
@@ -166,16 +193,16 @@ github.com/Shreesha001/raftkv/internal/raft      ← imports nothing else in the
 
 ### The node is a pure state machine
 
-`raft.Node` owns no goroutine, no timer, and no connection. Time and messages are *pushed in*; outbound messages are *pulled out*:
+`raft.Node` owns no goroutine, no timer, and no connection. Time and messages are pushed in, outbound messages are pulled out:
 
 ```go
-n.Tick()                  // one unit of time passed
-n.Step(msg)               // a message arrived
-msgs := n.Messages()      // what do you want sent?
+n.Tick()                          // one unit of time passed
+n.Step(msg)                       // a message arrived
+msgs := n.Messages()              // what do you want sent?
 entries := n.CommittedEntries()   // what is safe to apply?
 ```
 
-The goroutine, the real clock, and the network live in `internal/server`, outside the protocol. Which leads to the part of this project I would actually defend in an interview:
+The goroutine, the real clock, and the network live in `internal/server`, outside the protocol. That buys the property this project is really built around.
 
 ### Deterministic tests for a distributed system
 
@@ -193,34 +220,9 @@ c.run(300)
 // assert: exactly one leader, all terms agree, no committed entry lost
 ```
 
-**No `time.Sleep` appears anywhere in the test suite.** Split votes, network partitions, divergent logs, and crashed leaders are reproduced in microseconds and give the identical result on every run. This is the difference between tests that find consensus bugs and tests that flake in CI and get retried until green.
+**No `time.Sleep` appears anywhere in the test suite.** Split votes, network partitions, divergent logs, and crashed leaders are reproduced in microseconds and give an identical result on every run. That is the difference between tests that find consensus bugs and tests that flake in CI until someone hits retry.
 
 Real-process integration tests over loopback HTTP cover the parts determinism cannot reach.
-
-### Other decisions worth naming
-
-- **`Term` and `Index` are distinct types**, not bare `uint64`. Raft code handles `prevLogIndex`, `prevLogTerm`, `lastLogIndex`, and `lastLogTerm` side by side; transposing two is the classic bug and produces behaviour that looks almost right. Now it does not compile.
-- **A sentinel entry at log index 0.** The consistency check constantly asks for the term *before* a position, which for the first entry is index 0. One fake entry removes a special case from a dozen call sites.
-- **Durable before acknowledged.** A vote is written to disk before it is promised, and entries before they are acknowledged — because a node that forgets its vote after a crash can vote twice in one term, which elects two leaders, which loses data. Storage failure panics rather than continues: crashing is recoverable, silent divergence is not.
-- **Atomic persistence.** Write to a temp file → `fsync` → `rename` → `fsync` the directory. A crash at any point leaves either the complete old state or the complete new one.
-
----
-
-## Two bugs worth reading about
-
-Both were invisible until the system was actually run, and both are the interesting kind.
-
-### Stale reads after failover
-
-A newly elected leader had a committed entry sitting in its log — and answered `404` for it.
-
-Not a coding mistake. **Raft §5.4.2 forbids a leader from committing entries inherited from earlier terms**, because such an entry can still be overwritten by a future leader. With no new writes arriving, that entry stayed uncommitted forever, so the state machine never applied it, so a value already acknowledged to a client read back as missing.
-
-The fix is §8 of the paper: **a new leader appends a no-op entry the instant it takes office.** That entry belongs to the current term, so it can commit — and by the log matching property it drags every inherited entry into committed state with it. Plus a rule that a leader refuses reads until that no-op commits, closing the stale-read window entirely.
-
-### Two sentinel errors
-
-`raft.ErrNotLeader` and `server.ErrNotLeader` were different values. `errors.Is` said no, so writes to a follower returned `503` instead of redirecting to the leader. Fixed by translating at the package boundary — callers should match on one package's sentinel and never need to know which layer refused.
 
 ---
 
@@ -235,7 +237,7 @@ PEERS=1=localhost:8081,2=localhost:8082,3=localhost:8083
 ./raftkvd -id 3 -peers $PEERS -data-dir ./data &
 ```
 
-Write to any node — followers redirect, so `-L` is all you need:
+Write to any node. Followers redirect, so `-L` is all you need:
 
 ```bash
 curl -L -X PUT localhost:8082/kv/greeting -d 'hello world'
@@ -251,7 +253,7 @@ curl -s localhost:8081/status
 | `DELETE /kv/{key}` | Same guarantee |
 | `GET /status` | Role, term, leader, commit index |
 
-Then kill the leader and watch the top of this README happen.
+Then kill the leader and watch the top of this page happen.
 
 ---
 
@@ -262,7 +264,7 @@ Stated plainly, because a system's limits matter as much as its features:
 - **No snapshotting.** The log grows without bound, and every write rewrites the whole state file. Correct, and obviously wrong above a certain scale.
 - **Reads are not fully linearizable.** A leader deposed by a partition can serve stale data until it notices. Closing that requires confirming leadership with a heartbeat round before each read.
 - **Fixed membership.** Nodes cannot be added or removed while running.
-- **JSON over HTTP, not gRPC.** One struct, low volume, no protobuf toolchain. Any type satisfying the `Transport` interface can replace it.
+- **JSON over HTTP rather than gRPC.** One struct, low volume, no protobuf toolchain. Any type satisfying the `Transport` interface can replace it.
 
 Each is documented in the code at the place it matters.
 
@@ -270,4 +272,4 @@ Each is documented in the code at the place it matters.
 
 ## Reference
 
-[*In Search of an Understandable Consensus Algorithm*](https://raft.github.io/raft.pdf) — Diego Ongaro and John Ousterhout. Section 5.4.1 is the election restriction, 5.4.2 the commitment rule, and section 8 the no-op that fixed the bug above.
+[*In Search of an Understandable Consensus Algorithm*](https://raft.github.io/raft.pdf) by Diego Ongaro and John Ousterhout. Section 5.4.1 is the election restriction, 5.4.2 the commitment rule, and section 8 the no-op a new leader must commit before it can safely serve reads.
