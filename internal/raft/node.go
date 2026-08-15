@@ -88,6 +88,9 @@ type Node struct {
 
 	// Volatile state, rebuilt after a restart.
 	state State
+	// leader is who this node currently believes leads, or None if it does
+	// not know. Clients are redirected here rather than being told to guess.
+	leader NodeID
 	// votes records who has answered this node's candidacy, and how.
 	votes map[NodeID]bool
 
@@ -135,6 +138,7 @@ func NewNode(cfg Config) *Node {
 		id:       cfg.ID,
 		peers:    append([]NodeID(nil), cfg.Peers...),
 		votedFor: None,
+		leader:   None,
 		log:      NewLog(),
 		state:    Follower,
 		votes:    make(map[NodeID]bool),
@@ -209,6 +213,10 @@ func (n *Node) Term() Term { return n.currentTerm }
 
 // VotedFor returns who this node voted for in the current term, or None.
 func (n *Node) VotedFor() NodeID { return n.votedFor }
+
+// Leader returns the node this one believes leads the cluster, or None while
+// no leader is known — during an election, or just after losing contact.
+func (n *Node) Leader() NodeID { return n.leader }
 
 // CommitIndex returns the highest log index known to be committed.
 func (n *Node) CommitIndex() Index { return n.commitIndex }
@@ -305,6 +313,7 @@ func (n *Node) becomeFollower(term Term, votedFor NodeID) {
 	n.state = Follower
 	n.currentTerm = term
 	n.votedFor = votedFor
+	n.leader = None
 	n.votes = make(map[NodeID]bool)
 	n.resetElectionTimeout()
 	n.persist()
@@ -313,6 +322,7 @@ func (n *Node) becomeFollower(term Term, votedFor NodeID) {
 // startElection begins a new term with this node as a candidate.
 func (n *Node) startElection() {
 	n.state = Candidate
+	n.leader = None
 	n.currentTerm++
 	n.votedFor = n.id
 	n.votes = map[NodeID]bool{n.id: true} // a candidate always votes for itself
@@ -357,6 +367,7 @@ func (n *Node) tallyVotes() bool {
 // becomeLeader takes office and immediately announces it.
 func (n *Node) becomeLeader() {
 	n.state = Leader
+	n.leader = n.id
 	n.log.SetTerm(n.currentTerm)
 	n.heartbeatElapsed = 0
 

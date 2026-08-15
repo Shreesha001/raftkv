@@ -82,6 +82,8 @@ func (n *Node) handleAppendEntries(m Message) {
 		n.becomeFollower(m.Term, n.votedFor)
 	}
 
+	n.leader = m.From
+
 	// Contact from a leader restarts the countdown. This is the entire purpose
 	// of heartbeats: a leader that keeps talking keeps its followers from
 	// standing for election.
