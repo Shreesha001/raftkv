@@ -42,6 +42,9 @@ type Status struct {
 	Term   raft.Term
 	Leader raft.NodeID
 	Commit raft.Index
+	// ReadsReady reports whether this node may answer reads. A leader that has
+	// just taken office cannot until it has committed an entry of its own term.
+	ReadsReady bool
 }
 
 // proposal is a client write awaiting commitment.
@@ -144,13 +147,18 @@ func (s *Server) Status() Status {
 
 // Get reads a key.
 //
-// Reads are served only by the leader. A follower may be arbitrarily far
-// behind, and answering from a stale replica would let a client read a value
-// older than one it just wrote. Serving from the leader keeps that from
-// happening in the common case; a fully linearizable read would additionally
-// confirm leadership with a heartbeat round before answering.
+// Reads are served only by a leader that is ready. A follower may be
+// arbitrarily far behind, and answering from a stale replica would let a client
+// read a value older than one it just wrote. A newly elected leader is refused
+// too, until the no-op it appended on taking office commits: before that it
+// holds inherited entries it cannot prove are committed and has not applied
+// them, so it would report a successfully written key as missing.
+//
+// This is short of full linearizability: a leader deposed by a partition can
+// still answer from stale state until it notices. Closing that gap requires
+// confirming leadership with a heartbeat round before each read.
 func (s *Server) Get(key string) (string, bool, error) {
-	if s.Status().State != raft.Leader {
+	if !s.Status().ReadsReady {
 		return "", false, ErrNotLeader
 	}
 
@@ -252,6 +260,12 @@ func (s *Server) dispatch() {
 // applyEntry hands a committed entry to the state machine and wakes whoever
 // proposed it.
 func (s *Server) applyEntry(entry raft.LogEntry) {
+	// A leader commits an empty entry on taking office, which carries entries
+	// inherited from earlier terms into committed state. It holds no command.
+	if len(entry.Command) == 0 {
+		return
+	}
+
 	err := s.store.Apply(entry.Command)
 	if err != nil {
 		// The entry is committed, so every node will try to apply it and fail
@@ -290,11 +304,12 @@ func (s *Server) failPending(err error) {
 // publishStatus copies the node's role where other goroutines can read it.
 func (s *Server) publishStatus() {
 	status := Status{
-		ID:     s.node.ID(),
-		State:  s.node.State(),
-		Term:   s.node.Term(),
-		Leader: s.node.Leader(),
-		Commit: s.node.CommitIndex(),
+		ID:         s.node.ID(),
+		State:      s.node.State(),
+		Term:       s.node.Term(),
+		Leader:     s.node.Leader(),
+		Commit:     s.node.CommitIndex(),
+		ReadsReady: s.node.CanServeReads(),
 	}
 
 	s.mu.Lock()

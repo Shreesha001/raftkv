@@ -15,6 +15,17 @@ func leaderOfOne(t *testing.T) *Node {
 		t.Fatalf("setup: State() = %v, want Leader", n.State())
 	}
 	n.Messages()
+
+	// A new leader commits a no-op at index 1. Acknowledge it from both peers
+	// so the leader's view of them is caught up, as it would be shortly after
+	// any real election.
+	for _, peer := range []NodeID{2, 3} {
+		n.Step(Message{
+			Type: MsgAppendEntriesResponse, From: peer, To: 1,
+			Term: n.Term(), Success: true, MatchIndex: 1,
+		})
+	}
+	n.Messages()
 	return n
 }
 
@@ -47,13 +58,14 @@ func TestLeaderAppendsProposalToItsOwnLog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose: %v", err)
 	}
-	if index != 1 {
-		t.Errorf("Propose returned index %d, want 1", index)
+	// Index 1 is the leader's no-op, so the first client command is index 2.
+	if index != 2 {
+		t.Errorf("Propose returned index %d, want 2", index)
 	}
 
-	entry, ok := n.log.EntryAt(1)
+	entry, ok := n.log.EntryAt(2)
 	if !ok {
-		t.Fatal("entry 1 missing from the leader's log")
+		t.Fatal("entry 2 missing from the leader's log")
 	}
 	if string(entry.Command) != "set x 1" {
 		t.Errorf("entry command = %q, want %q", entry.Command, "set x 1")
@@ -82,10 +94,10 @@ func TestLeaderSendsProposalToEveryFollower(t *testing.T) {
 		if len(m.Entries) != 1 || string(m.Entries[0].Command) != "a" {
 			t.Errorf("to %v: Entries = %+v, want one entry %q", peer, m.Entries, "a")
 		}
-		// A new leader's log is empty, so the entry before this one is the
-		// sentinel at index 0.
-		if m.PrevLogIndex != 0 || m.PrevLogTerm != 0 {
-			t.Errorf("to %v: prev = (%d, %d), want (0, 0)", peer, m.PrevLogIndex, m.PrevLogTerm)
+		// The entry before it is the leader's no-op at index 1.
+		if m.PrevLogIndex != 1 || m.PrevLogTerm != n.Term() {
+			t.Errorf("to %v: prev = (%d, %d), want (1, %d)",
+				peer, m.PrevLogIndex, m.PrevLogTerm, n.Term())
 		}
 	}
 }
@@ -212,9 +224,8 @@ func TestLeaderRetriesFromEarlierIndexAfterRejection(t *testing.T) {
 			t.Fatalf("Propose: %v", err)
 		}
 	}
-	// A leader that believes this follower already holds everything, which is
-	// what it assumes on taking office.
-	n.nextIndex[2] = 4
+	// The log is now: 1 no-op, 2 a, 3 b, 4 c. Assume the follower holds it all.
+	n.nextIndex[2] = 5
 	n.Messages()
 
 	n.Step(Message{Type: MsgAppendEntriesResponse, From: 2, To: 1, Term: n.Term(), Success: false})
@@ -224,11 +235,11 @@ func TestLeaderRetriesFromEarlierIndexAfterRejection(t *testing.T) {
 	if !ok {
 		t.Fatal("leader did not retry after a rejection")
 	}
-	if m.PrevLogIndex != 2 {
-		t.Errorf("PrevLogIndex = %d, want 2: the leader should step back one entry", m.PrevLogIndex)
+	if m.PrevLogIndex != 3 {
+		t.Errorf("PrevLogIndex = %d, want 3: the leader should step back one entry", m.PrevLogIndex)
 	}
 	if len(m.Entries) != 1 {
-		t.Errorf("sent %d entries, want 1 from index 3 onward", len(m.Entries))
+		t.Errorf("sent %d entries, want 1 from index 4 onward", len(m.Entries))
 	}
 }
 
@@ -241,8 +252,9 @@ func TestLeaderCommitsOnMajorityAcknowledgement(t *testing.T) {
 	}
 	n.Messages()
 
-	if got := n.CommitIndex(); got != 0 {
-		t.Fatalf("CommitIndex() = %d before any acknowledgement, want 0", got)
+	// The no-op at index 1 is already committed; the new entry is not.
+	if got := n.CommitIndex(); got >= index {
+		t.Fatalf("CommitIndex() = %d before acknowledgement, want below %d", got, index)
 	}
 
 	n.Step(Message{
@@ -295,35 +307,41 @@ func TestLeaderDoesNotCommitWithoutMajority(t *testing.T) {
 // overwritten. It becomes committed only once an entry from the leader's own
 // term is committed alongside it.
 func TestLeaderDoesNotCommitEntriesFromEarlierTerms(t *testing.T) {
-	n := leaderOfOne(t)
-	// Plant an entry from an older term, as if inherited from a previous leader.
-	n.log.SetTerm(n.Term() - 1)
-	n.log.Append([]byte("old"))
-	n.log.SetTerm(n.Term())
+	n := newTestNode(1, 2, 3)
+
+	// A log inherited from an earlier leader: one entry from term 2.
+	n.log.SetTerm(2)
+	n.log.Append([]byte("inherited"))
+
+	// Win an election in term 5, which appends a no-op at index 2.
+	n.state = Candidate
+	n.currentTerm = 5
+	n.votes = map[NodeID]bool{1: true}
+	n.Step(Message{Type: MsgRequestVoteResponse, From: 2, To: 1, Term: 5, Granted: true})
+	if n.State() != Leader {
+		t.Fatalf("setup: State() = %v, want Leader", n.State())
+	}
 	n.Messages()
 
+	// A majority now holds the inherited entry — but it belongs to term 2, and
+	// an entry from an earlier term can still be overwritten by a future
+	// leader, so committing it here would be unsafe.
 	n.Step(Message{
 		Type: MsgAppendEntriesResponse, From: 2, To: 1,
-		Term: n.Term(), Success: true, MatchIndex: 1,
+		Term: 5, Success: true, MatchIndex: 1,
 	})
-
 	if got := n.CommitIndex(); got != 0 {
 		t.Errorf("CommitIndex() = %d for an entry from an earlier term, want 0", got)
 	}
 
-	// Committing an entry from the current term carries the older one with it.
-	index, err := n.Propose([]byte("current"))
-	if err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	n.Messages()
+	// Once an entry from the leader's own term commits, everything before it
+	// commits with it.
 	n.Step(Message{
 		Type: MsgAppendEntriesResponse, From: 2, To: 1,
-		Term: n.Term(), Success: true, MatchIndex: index,
+		Term: 5, Success: true, MatchIndex: 2,
 	})
-
-	if got := n.CommitIndex(); got != index {
-		t.Errorf("CommitIndex() = %d, want %d once a current-term entry committed", got, index)
+	if got := n.CommitIndex(); got != 2 {
+		t.Errorf("CommitIndex() = %d once a current-term entry committed, want 2", got)
 	}
 }
 

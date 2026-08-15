@@ -165,6 +165,11 @@ func (c *cluster) commands(id NodeID) []string {
 		if !ok {
 			break
 		}
+		// Skip the empty entry a leader commits on taking office: it is
+		// internal bookkeeping, not a client command.
+		if len(entry.Command) == 0 {
+			continue
+		}
 		out = append(out, string(entry.Command))
 	}
 	return out
@@ -330,11 +335,12 @@ func TestClusterReplicatesProposalsToEveryNode(t *testing.T) {
 		}
 	}
 
-	// And every node knows those entries are committed, so every node may
-	// apply them.
+	// And every node agrees on how far it is safe to apply. The commit index
+	// counts the leader's no-op as well as the three commands.
+	wantCommit := Index(len(want) + 1)
 	for id, n := range c.nodes {
-		if got := n.CommitIndex(); got != 3 {
-			t.Errorf("%v: CommitIndex() = %d, want 3", id, got)
+		if got := n.CommitIndex(); got != wantCommit {
+			t.Errorf("%v: CommitIndex() = %d, want %d", id, got, wantCommit)
 		}
 	}
 }
@@ -352,6 +358,9 @@ func TestClusterDeliversIdenticalCommittedEntries(t *testing.T) {
 	applied := map[NodeID][]string{}
 	for id, n := range c.nodes {
 		for _, entry := range n.CommittedEntries() {
+			if len(entry.Command) == 0 {
+				continue // leader's no-op
+			}
 			applied[id] = append(applied[id], string(entry.Command))
 		}
 	}

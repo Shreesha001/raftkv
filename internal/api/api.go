@@ -134,10 +134,20 @@ func (h *Handler) replicate(w http.ResponseWriter, r *http.Request, cmd kv.Comma
 // leader is known — during an election — there is nowhere to send the client,
 // and 503 tells it to retry shortly.
 func (h *Handler) redirectToLeader(w http.ResponseWriter, r *http.Request) {
-	leader := h.server.Status().Leader
+	status := h.server.Status()
 
-	address, ok := h.peerAddresses[leader]
-	if leader == raft.None || !ok {
+	// This node leads but is not yet serving — a leader that has just taken
+	// office and has not committed an entry of its own term. Redirecting would
+	// point the client back here and loop until it gives up, so tell it to
+	// retry instead.
+	if status.Leader == status.ID {
+		http.Error(w, "leader is still catching up; retry shortly",
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	address, ok := h.peerAddresses[status.Leader]
+	if status.Leader == raft.None || !ok {
 		http.Error(w, "no leader elected; retry shortly", http.StatusServiceUnavailable)
 		return
 	}

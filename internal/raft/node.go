@@ -91,6 +91,10 @@ type Node struct {
 	// leader is who this node currently believes leads, or None if it does
 	// not know. Clients are redirected here rather than being told to guess.
 	leader NodeID
+	// readyIndex is the no-op this node appended on taking office. Until it
+	// commits, the leader has not confirmed which inherited entries are real
+	// and must not answer reads.
+	readyIndex Index
 	// votes records who has answered this node's candidacy, and how.
 	votes map[NodeID]bool
 
@@ -217,6 +221,18 @@ func (n *Node) VotedFor() NodeID { return n.votedFor }
 // Leader returns the node this one believes leads the cluster, or None while
 // no leader is known — during an election, or just after losing contact.
 func (n *Node) Leader() NodeID { return n.leader }
+
+// CanServeReads reports whether this node may answer client reads.
+//
+// A leader that has just taken office holds entries inherited from previous
+// terms that it cannot yet prove are committed, so it does not know its own
+// state machine is current. Answering a read then can return a value older
+// than one already acknowledged to a client. Once the no-op appended on
+// election commits, every inherited entry has committed with it and the state
+// machine is known to be up to date.
+func (n *Node) CanServeReads() bool {
+	return n.state == Leader && n.commitIndex >= n.readyIndex
+}
 
 // CommitIndex returns the highest log index known to be committed.
 func (n *Node) CommitIndex() Index { return n.commitIndex }
@@ -384,6 +400,25 @@ func (n *Node) becomeLeader() {
 
 	n.logger.V(1).Info("became leader", "term", n.currentTerm,
 		"lastIndex", n.log.LastIndex())
+
+	// Commit a no-op entry immediately (Raft paper, section 8).
+	//
+	// A leader may not commit entries inherited from earlier terms directly —
+	// section 5.4.2 forbids it, because such entries can still be overwritten.
+	// They become committed only once an entry from the current term commits
+	// and carries them along. Without this, a leader that takes office holding
+	// uncommitted-but-replicated entries would never apply them until the next
+	// client write, so a value already acknowledged to a client could read back
+	// as missing.
+	//
+	// The entry carries no command; the application skips it.
+	noop := n.log.Append(nil)
+	n.readyIndex = noop
+	n.matchIndex[n.id] = noop
+	n.persist()
+	// A single-node cluster is its own majority, so nothing will arrive later
+	// to trigger the commit check.
+	n.advanceCommit()
 
 	// Announce immediately rather than waiting a heartbeat interval: until
 	// followers hear from the new leader they are still counting down to their
